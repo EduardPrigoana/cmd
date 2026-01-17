@@ -1,46 +1,18 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"io"
 	"net/http"
 	"os"
 	"sync"
 	"time"
 )
 
-var (
-	lastText  string
-	savedAt   time.Time
-	mu        sync.RWMutex
-	password  string
-)
-
-func main() {
-	password = os.Getenv("PASSWORD")
-	if password == "" {
-		panic("PASSWORD env not set")
-	}
-
-	http.HandleFunc("/", handleMain)
-	http.HandleFunc("/raw", handleRaw)
-	http.ListenAndServe(":8080", nil)
-}
-
-func handleMain(w http.ResponseWriter, r *http.Request) {
-	msg := ""
-	if r.Method == "POST" {
-		if r.FormValue("password") != password {
-			msg = "wrong password"
-		} else {
-			mu.Lock()
-			lastText = r.FormValue("text")
-			savedAt = time.Now()
-			mu.Unlock()
-			msg = "saved"
-		}
-	}
-
-	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(`<!DOCTYPE html>
+const (
+	htmlPrefix = `<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -58,28 +30,129 @@ button:hover{background:#aaa}
 </head>
 <body>
 <form method="POST">
-<div class="msg">` + msg + `</div>
+<div class="msg">`
+
+	htmlMid = `</div>
 <textarea name="text" placeholder="type anything"></textarea>
-<input type="password" name="password" placeholder="password">
-<button type="submit">send</button>
+`
+
+	htmlSuffix = `<button type="submit">send</button>
 </form>
 </body>
-</html>`))
+</html>`
+
+	pwField        = `<input type="password" name="password" placeholder="password">`
+	expiration     = 5 * time.Minute
+	cookieDuration = 30 * 24 * time.Hour
+)
+
+type store struct {
+	sync.RWMutex
+	text    string
+	savedAt time.Time
+}
+
+func (s *store) Set(text string) {
+	s.Lock()
+	s.text = text
+	s.savedAt = time.Now()
+	s.Unlock()
+}
+
+func (s *store) Get() (string, time.Time) {
+	s.RLock()
+	t, ts := s.text, s.savedAt
+	s.RUnlock()
+	return t, ts
+}
+
+var (
+	data      store
+	password  string
+	authToken []byte
+)
+
+func main() {
+	password = os.Getenv("PASSWORD")
+	if password == "" {
+		password = "PASSWORD"
+	}
+
+	h := sha256.Sum256([]byte(password))
+	authToken = []byte(hex.EncodeToString(h[:]))
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", handleGet)
+	mux.HandleFunc("POST /{$}", handlePost)
+	mux.HandleFunc("GET /raw", handleRaw)
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+	}
+
+	srv.ListenAndServe()
+}
+
+func isAuthed(r *http.Request) bool {
+	c, err := r.Cookie("auth")
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(c.Value), authToken) == 1
+}
+
+func handleGet(w http.ResponseWriter, r *http.Request) {
+	renderPage(w, r, "")
+}
+
+func handlePost(w http.ResponseWriter, r *http.Request) {
+	if !isAuthed(r) {
+		if subtle.ConstantTimeCompare([]byte(r.FormValue("password")), []byte(password)) != 1 {
+			renderPage(w, r, "wrong password")
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "auth",
+			Value:    string(authToken),
+			Expires:  time.Now().Add(cookieDuration),
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+		})
+	}
+
+	data.Set(r.FormValue("text"))
+	renderPage(w, r, "saved")
+}
+
+func renderPage(w http.ResponseWriter, r *http.Request, msg string) {
+	w.Header().Set("Content-Type", "text/html;charset=utf-8")
+	io.WriteString(w, htmlPrefix)
+	io.WriteString(w, msg)
+	io.WriteString(w, htmlMid)
+	if !isAuthed(r) {
+		io.WriteString(w, pwField)
+	}
+	io.WriteString(w, htmlSuffix)
 }
 
 func handleRaw(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	text := lastText
-	ts := savedAt
-	mu.RUnlock()
+	text, ts := data.Get()
 
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-
-	if text == "" || time.Since(ts) > 5*time.Minute {
-		w.WriteHeader(http.StatusGone)
-		w.Write([]byte("expired"))
+	if text == "" || time.Since(ts) > expiration {
+		http.Error(w, "expired", http.StatusGone)
 		return
 	}
 
-	w.Write([]byte(text))
+	io.WriteString(w, text)
 }
